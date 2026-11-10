@@ -1,26 +1,40 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Scientia Square Park Brand Palette (Figma Design Foundations 429:520) */
+  --sqp-park-green: #4D8B45;
+  --sqp-fresh-lime: #A8C943;
+  --sqp-sunshine-yellow: #F2C94C;
+  --sqp-soft-sage: #E8EFD9;
+  --sqp-warm-cream: #FFF4DC;
+  --sqp-deep-forest: #263B29;
+  --sqp-warm-grey: #6B665C;
+  --sqp-cloud-white: #FFFFFF;
+  --sqp-adventure-orange: #F28C28;
+
+  --font-open-sans: "Open Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-inter: "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --background: #FFF4DC;
+  --foreground: #263B29;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-park-green: #4D8B45;
+  --color-fresh-lime: #A8C943;
+  --color-sunshine-yellow: #F2C94C;
+  --color-soft-sage: #E8EFD9;
+  --color-warm-cream: #FFF4DC;
+  --color-deep-forest: #263B29;
+  --color-warm-grey: #6B665C;
+  --color-adventure-orange: #F28C28;
+  --font-sans: var(--font-open-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-open-sans), Arial, Helvetica, sans-serif;
 }
