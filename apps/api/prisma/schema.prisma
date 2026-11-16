@@ -1,8 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -10,4 +5,331 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+enum QueueMode {
+  MANUAL_FIFO
+  ROLLING_CAPACITY
+  TIMED_ROLLING_CAPACITY
+
+  @@map("queue_mode")
+}
+
+// ==========================================
+// USER & AUTHENTICATION
+// ==========================================
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  staffProfile      StaffProfile?
+  oauthAccounts     OAuthAccount[]
+  guestSessions     GuestSession[]
+  queuePasses       QueuePass[]
+  queueEntries      QueueEntry[]
+  pushSubscriptions PushSubscription[]
+  notifications     Notification[]
+
+  @@map("user")
+}
+
+model OAuthAccount {
+  id                String   @id @default(uuid()) @db.Uuid
+  userId            String   @map("user_id") @db.Uuid
+  provider          String
+  providerAccountId String   @map("provider_account_id")
+  email             String?
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("oauth_account")
+}
+
+model GuestSession {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String?   @map("user_id") @db.Uuid
+  tokenHash    String    @unique @map("token_hash")
+  expiresAt    DateTime  @map("expires_at") @db.Timestamptz(6)
+  lastActiveAt DateTime? @map("last_active_at") @db.Timestamptz(6)
+  revokedAt    DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user              User?              @relation(fields: [userId], references: [id])
+  queuePasses       QueuePass[]
+  queueEntries      QueueEntry[]
+  pushSubscriptions PushSubscription[]
+  notifications     Notification[]
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("guest_session")
+}
+
+// ==========================================
+// ATTRACTION
+// ==========================================
+
+model Attraction {
+  id                 String  @id @default(uuid()) @db.Uuid
+  parentAttractionId String? @map("parent_attraction_id") @db.Uuid
+  name               String
+  category           String
+
+  parent   Attraction?  @relation("AttractionHierarchy", fields: [parentAttractionId], references: [id])
+  children Attraction[] @relation("AttractionHierarchy")
+
+  externalTickets ExternalTicket[]
+  queuePasses     QueuePass[]
+  queueSessions   QueueSession[]
+
+  @@index([parentAttractionId])
+  @@map("attraction")
+}
+
+// ==========================================
+// EXTERNAL TICKET
+// ==========================================
+
+model ExternalTicket {
+  id                String @id @default(uuid()) @db.Uuid
+  attractionId      String @map("attraction_id") @db.Uuid
+  externalTicketRef String @unique @map("external_ticket_ref")
+  purchasedQuantity Int    @map("purchased_quantity")
+  redeemedQuantity  Int    @default(0) @map("redeemed_quantity")
+  validationStatus  String @map("validation_status")
+
+  attraction  Attraction  @relation(fields: [attractionId], references: [id])
+  queuePasses QueuePass[]
+
+  @@index([attractionId])
+  @@map("external_ticket")
+}
+
+// ==========================================
+// QUEUE PASS
+// ==========================================
+
+model QueuePass {
+  id                  String   @id @default(uuid()) @db.Uuid
+  externalTicketId    String   @map("external_ticket_id") @db.Uuid
+  attractionId        String   @map("attraction_id") @db.Uuid
+  userId              String?  @map("user_id") @db.Uuid
+  guestSessionId      String?  @map("guest_session_id") @db.Uuid
+  qrTokenHash         String   @unique @map("qr_token_hash")
+  entitlementQuantity Int      @map("entitlement_quantity")
+  consumedQuantity    Int      @default(0) @map("consumed_quantity")
+  expiresAt           DateTime @map("expires_at") @db.Timestamptz(6)
+
+  externalTicket ExternalTicket @relation(fields: [externalTicketId], references: [id])
+  user           User?          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  guestSession   GuestSession?  @relation(fields: [guestSessionId], references: [id], onDelete: Restrict)
+  queueEntry     QueueEntry?
+  attraction     Attraction     @relation(fields: [attractionId], references: [id])
+
+  @@index([externalTicketId])
+  @@index([attractionId])
+  @@index([userId])
+  @@index([guestSessionId])
+  @@map("queue_pass")
+}
+
+// ==========================================
+// QUEUE SESSION
+// ==========================================
+
+model QueueSession {
+  id                 String    @id @default(uuid()) @db.Uuid
+  attractionId       String    @map("attraction_id") @db.Uuid
+  queueMode          QueueMode @map("queue_mode")
+  capacity           Int
+  maxDurationMinutes Int?      @map("max_duration_minutes")
+  startsAt           DateTime  @map("starts_at") @db.Timestamptz(6)
+  endsAt             DateTime  @map("ends_at") @db.Timestamptz(6)
+  status             String
+
+  attraction Attraction   @relation(fields: [attractionId], references: [id])
+  entries    QueueEntry[]
+
+  @@index([attractionId])
+  @@index([startsAt, endsAt])
+  @@map("queue_session")
+}
+
+// ==========================================
+// QUEUE ENTRY
+// ==========================================
+
+model QueueEntry {
+  id             String   @id @default(uuid()) @db.Uuid
+  queuePassId    String?  @unique @map("queue_pass_id") @db.Uuid
+  sessionId      String   @map("session_id") @db.Uuid
+  userId         String?  @map("user_id") @db.Uuid
+  guestSessionId String?  @map("guest_session_id") @db.Uuid
+  partySize      Int      @map("party_size")
+  ticketNumber   Int      @map("ticket_number")
+  joinedAt       DateTime @default(now()) @map("joined_at") @db.Timestamptz(6)
+  status         String
+
+  queuePass     QueuePass?          @relation(fields: [queuePassId], references: [id])
+  session       QueueSession        @relation(fields: [sessionId], references: [id])
+  user          User?               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  guestSession  GuestSession?       @relation(fields: [guestSessionId], references: [id], onDelete: Restrict)
+  attempts      QueueEntryAttempt[]
+  notifications Notification[]
+  operationLogs QueueOperationLog[]
+
+  @@unique([sessionId, ticketNumber])
+  @@index([sessionId])
+  @@index([userId])
+  @@index([guestSessionId])
+  @@map("queue_entry")
+}
+
+// ==========================================
+// QUEUE ENTRY ATTEMPT
+// ==========================================
+
+model QueueEntryAttempt {
+  id                     String    @id @default(uuid()) @db.Uuid
+  queueEntryId           String    @map("queue_entry_id") @db.Uuid
+  attemptNumber          Int       @map("attempt_number")
+  calledQuantity         Int       @map("called_quantity")
+  boardedQuantity        Int       @map("boarded_quantity")
+  carriedForwardQuantity Int       @map("carried_forward_quantity")
+  calledAt               DateTime  @default(now()) @map("called_at") @db.Timestamptz(6)
+  completedAt            DateTime? @map("completed_at") @db.Timestamptz(6)
+
+  queueEntry  QueueEntry       @relation(fields: [queueEntryId], references: [id])
+  occupancies QueueOccupancy[]
+
+  @@unique([queueEntryId, attemptNumber])
+  @@map("queue_entry_attempt")
+}
+
+// ==========================================
+// QUEUE OCCUPANCY
+// One record = one person using an attraction
+// ==========================================
+
+model QueueOccupancy {
+  id            String    @id @default(uuid()) @db.Uuid
+  attemptId     String    @map("attempt_id") @db.Uuid
+  startedAt     DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  expectedEndAt DateTime? @map("expected_end_at") @db.Timestamptz(6)
+  endedAt       DateTime? @map("ended_at") @db.Timestamptz(6)
+
+  attempt QueueEntryAttempt @relation(fields: [attemptId], references: [id])
+
+  @@index([attemptId])
+  @@index([endedAt])
+  @@map("queue_occupancy")
+}
+
+// ==========================================
+// STAFF & SHIFT
+// ==========================================
+
+model StaffProfile {
+  id           String @id @default(uuid()) @db.Uuid
+  userId       String @unique @map("user_id") @db.Uuid
+  employeeCode String @unique @map("employee_code")
+
+  user             User              @relation(fields: [userId], references: [id])
+  shiftAssignments ShiftAssignment[]
+
+  @@map("staff_profile")
+}
+
+model StaffShift {
+  id        String   @id @default(uuid()) @db.Uuid
+  startedAt DateTime @map("started_at") @db.Timestamptz(6)
+  endedAt   DateTime @map("ended_at") @db.Timestamptz(6)
+
+  assignments ShiftAssignment[]
+
+  @@map("staff_shift")
+}
+
+model ShiftAssignment {
+  id             String @id @default(uuid()) @db.Uuid
+  shiftId        String @map("shift_id") @db.Uuid
+  staffProfileId String @map("staff_profile_id") @db.Uuid
+
+  shift         StaffShift          @relation(fields: [shiftId], references: [id])
+  staffProfile  StaffProfile        @relation(fields: [staffProfileId], references: [id])
+  operationLogs QueueOperationLog[]
+
+  @@unique([shiftId, staffProfileId])
+  @@index([staffProfileId])
+  @@map("shift_assignment")
+}
+
+// ==========================================
+// QUEUE OPERATION LOG
+// ==========================================
+
+model QueueOperationLog {
+  id                String   @id @default(uuid()) @db.Uuid
+  queueEntryId      String?  @map("queue_entry_id") @db.Uuid
+  shiftAssignmentId String   @map("shift_assignment_id") @db.Uuid
+  action            String
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  queueEntry      QueueEntry?     @relation(fields: [queueEntryId], references: [id])
+  shiftAssignment ShiftAssignment @relation(fields: [shiftAssignmentId], references: [id])
+
+  @@index([queueEntryId])
+  @@index([shiftAssignmentId])
+  @@map("queue_operation_log")
+}
+
+// ==========================================
+// NOTIFICATION & PUSH SUBSCRIPTION
+// ==========================================
+
+model Notification {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String?   @map("user_id") @db.Uuid
+  guestSessionId String?   @map("guest_session_id") @db.Uuid
+  queueEntryId   String?   @map("queue_entry_id") @db.Uuid
+  title          String
+  message        String
+  type           String
+  readAt         DateTime? @map("read_at") @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  guestSession GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Restrict)
+  queueEntry   QueueEntry?   @relation(fields: [queueEntryId], references: [id])
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@index([queueEntryId])
+  @@map("notification")
+}
+
+model PushSubscription {
+  id             String    @id @default(uuid()) @db.Uuid
+  userId         String?   @map("user_id") @db.Uuid
+  guestSessionId String?   @map("guest_session_id") @db.Uuid
+  endpoint       String    @unique
+  p256dh         String
+  auth           String
+  expirationTime DateTime? @map("expiration_time") @db.Timestamptz(6)
+  revokedAt      DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Restrict)
+  guestSession GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([guestSessionId])
+  @@map("push_subscription")
 }
