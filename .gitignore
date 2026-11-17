@@ -59,7 +59,9 @@ desktop.ini
 # Test artifacts
 .nyc_output/
 
-# Local database backups
+# Local database backups & runtime store
 *.sql.bak 
 *.dump 
 *.backup
+apps/web/.data/
+apps/web/public/qr_codes/

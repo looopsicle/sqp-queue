@@ -1,5 +1,6 @@
 @import "tailwindcss";
 
+/* SQP Queue Visitor & Worker global theme tokens */
 :root {
   /* Scientia Square Park Brand Palette (Figma Design Foundations 429:520) */
   --sqp-park-green: #4D8B45;

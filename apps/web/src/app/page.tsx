@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import {
   ATTRACTIONS,
   AttractionId,
@@ -10,6 +11,7 @@ import {
   SampleReceiptPreset,
   VisitorTicket,
 } from "../data/visitorData";
+import { DbAccountPublic, WorkerQrTicketRecord } from "../data/dbTypes";
 import {
   BrowserVlmCapabilities,
   VlmReceiptScanResult,
@@ -17,6 +19,12 @@ import {
   downsampleReceiptImage,
   scanReceiptWithBrowserVlm,
 } from "../utils/receiptVlmScanner";
+import {
+  decodeQrFromImageData,
+  decodeUploadedQrImage,
+  extractClaimCodeFromQrPayload,
+} from "../utils/qrTicketCodec";
+import { QrMatrixSvg } from "../components/QrMatrixSvg";
 
 type ActiveScreen =
   | "login"
@@ -102,6 +110,29 @@ export default function VisitorPortalApp() {
   const [authMode, setAuthMode] = useState<AuthMode>("google");
   const [showGoogleOAuthChooser, setShowGoogleOAuthChooser] = useState(false);
 
+  // Database Synced Account & Worker QR State
+  const [currentAccountId, setCurrentAccountId] = useState<string>("acc-kevcak");
+  const [dbAccounts, setDbAccounts] = useState<DbAccountPublic[]>([]);
+  const [availableWorkerQrs, setAvailableWorkerQrs] = useState<
+    WorkerQrTicketRecord[]
+  >([]);
+  const [isSyncingDb, setIsSyncingDb] = useState<boolean>(false);
+
+  // Login / Register View State (Figma 404:630, 404:807, 404:909, 404:1097)
+  const [authViewTab, setAuthViewTab] = useState<
+    "welcome" | "credentials" | "register" | "register-success"
+  >("welcome");
+  const [loginForm, setLoginForm] = useState({ identifier: "", password: "" });
+  const [registerForm, setRegisterForm] = useState({
+    username: "",
+    fullName: "",
+    email: "",
+    phone: "",
+    password: "",
+  });
+  const [authFormError, setAuthFormError] = useState<string | null>(null);
+  const [registeredAccountName, setRegisteredAccountName] = useState<string>("");
+
   // Attraction & Ticket Selection
   const [selectedAttractionId, setSelectedAttractionId] =
     useState<AttractionId>("sqp-express");
@@ -137,7 +168,20 @@ export default function VisitorPortalApp() {
   const [showPasswordSuccessModal, setShowPasswordSuccessModal] =
     useState(false);
   const [showReceiptScannerModal, setShowReceiptScannerModal] = useState(false);
+  const [scannerMode, setScannerMode] = useState<"qr-claim" | "pos-ocr">(
+    "qr-claim"
+  );
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Worker QR Claim Scanner State
+  const [qrCodeInput, setQrCodeInput] = useState<string>("");
+  const [qrScanError, setQrScanError] = useState<string | null>(null);
+  const [qrScanMethodNote, setQrScanMethodNote] = useState<string>("");
+  const [isClaimingQr, setIsClaimingQr] = useState(false);
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const autoClaimStartedRef = useRef<string | null>(null);
 
   // Receipt VLM Scanner State
   const [vlmCaps, setVlmCaps] = useState<BrowserVlmCapabilities>({
@@ -167,7 +211,7 @@ export default function VisitorPortalApp() {
     setVlmCaps(detectBrowserVlmCapabilities());
   }, []);
 
-  // User Profile State (Google user vs Guest — Guest never shows a Guest ID)
+  // User Profile State (Account user vs Guest — Guest never shows a Guest ID)
   const [profileSubView, setProfileSubView] = useState<ProfileSubView>("main");
   const [userProfile, setUserProfile] = useState({
     username: "Kevcak",
@@ -186,12 +230,219 @@ export default function VisitorPortalApp() {
   const holderDisplayName =
     authMode === "guest" ? "Guest" : userProfile.username || "James";
 
-  const triggerToast = (msg: string) => {
+  const triggerToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 3400);
-  };
+  }, []);
+
+  const applyAccountPayload = useCallback(
+    (data: {
+      account?: DbAccountPublic;
+      accounts?: DbAccountPublic[];
+      activeTickets?: VisitorTicket[];
+      historyTickets?: VisitorTicket[];
+    }) => {
+      if (data.accounts) {
+        setDbAccounts(data.accounts);
+      }
+      if (data.account) {
+        setCurrentAccountId(data.account.id);
+        try {
+          window.localStorage.setItem("sqp_active_account_id", data.account.id);
+        } catch {
+          // Ignore storage error
+        }
+        setAuthMode(data.account.isGuest ? "guest" : "google");
+        if (!data.account.isGuest) {
+          setUserProfile({
+            username: data.account.username,
+            fullName: data.account.fullName,
+            email: data.account.email,
+            phone: data.account.phone,
+          });
+        }
+      }
+      if (data.activeTickets) {
+        setTickets(data.activeTickets);
+        if (data.activeTickets[0]) {
+          setSelectedTicketId(data.activeTickets[0].id);
+        }
+      }
+      if (data.historyTickets) {
+        setHistoryTickets(data.historyTickets);
+      }
+    },
+    []
+  );
+
+  const syncAvailableWorkerQrs = useCallback(async () => {
+    try {
+      const res = await fetch("/api/db/worker-qr", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { qrs?: WorkerQrTicketRecord[] };
+      if (data.qrs) {
+        setAvailableWorkerQrs(data.qrs);
+      }
+    } catch {
+      // Ignore network hiccup
+    }
+  }, []);
+
+  const syncAccountFromDb = useCallback(
+    async (accountIdToLoad: string) => {
+      setIsSyncingDb(true);
+      try {
+        const res = await fetch(
+          `/api/db/accounts?accountId=${encodeURIComponent(accountIdToLoad)}`,
+          { cache: "no-store" }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          applyAccountPayload(data);
+        } else {
+          const fallbackRes = await fetch(
+            "/api/db/accounts?accountId=acc-kevcak",
+            { cache: "no-store" }
+          );
+          if (fallbackRes.ok) {
+            applyAccountPayload(await fallbackRes.json());
+          }
+        }
+      } catch {
+        // Fallback keeps initial state
+      } finally {
+        setIsSyncingDb(false);
+      }
+    },
+    [applyAccountPayload]
+  );
+
+  useEffect(() => {
+    let savedId = "acc-kevcak";
+    try {
+      savedId =
+        window.localStorage.getItem("sqp_active_account_id") || "acc-kevcak";
+    } catch {
+      savedId = "acc-kevcak";
+    }
+
+    let claimCodeFromUrl: string | null = null;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const rawClaimParam = params.get("claim") || params.get("qr");
+      if (rawClaimParam) {
+        claimCodeFromUrl =
+          extractClaimCodeFromQrPayload(rawClaimParam) ||
+          rawClaimParam.trim().toUpperCase();
+      }
+    } catch {
+      claimCodeFromUrl = null;
+    }
+
+    if (claimCodeFromUrl) {
+      if (autoClaimStartedRef.current === claimCodeFromUrl) {
+        return;
+      }
+      autoClaimStartedRef.current = claimCodeFromUrl;
+
+      const claimFromUrl = async (code: string) => {
+        setIsSyncingDb(true);
+        setIsClaimingQr(true);
+        try {
+          const res = await fetch("/api/db/tickets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "claim-qr",
+              accountId: savedId,
+              claimCode: code,
+            }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            applyAccountPayload(data);
+            if (data.workerQrs) {
+              setAvailableWorkerQrs(data.workerQrs);
+            }
+            if (data.ticket) {
+              setSelectedTicketId(data.ticket.id);
+              setSelectedAttractionId(data.ticket.attractionId);
+            }
+            setTicketsTab("my-tickets");
+            setActiveScreen("tickets");
+            const ownerName = data.account?.isGuest
+              ? "Guest"
+              : data.account?.fullName || data.account?.username || savedId;
+            triggerToast(
+              `Tiket ${data.ticket?.attractionName ?? ""} (${code}) berhasil diklaim ke akun ${ownerName}!`
+            );
+          } else {
+            await syncAccountFromDb(savedId);
+            await syncAvailableWorkerQrs();
+            setQrCodeInput(code);
+            setQrScanError(data.error || "Gagal mengklaim QR tiket.");
+            setScannerMode("qr-claim");
+            setShowReceiptScannerModal(true);
+            triggerToast(data.error || "QR tiket gagal diklaim.");
+          }
+        } catch {
+          await syncAccountFromDb(savedId);
+          await syncAvailableWorkerQrs();
+          setQrCodeInput(code);
+          setQrScanError("Gagal terhubung ke server database saat klaim QR.");
+          setScannerMode("qr-claim");
+          setShowReceiptScannerModal(true);
+        } finally {
+          setIsClaimingQr(false);
+          setIsSyncingDb(false);
+          try {
+            window.history.replaceState({}, "", window.location.pathname);
+          } catch {
+            // Ignore history error
+          }
+        }
+      };
+
+      void claimFromUrl(claimCodeFromUrl);
+      return;
+    }
+
+    if (!autoClaimStartedRef.current) {
+      syncAccountFromDb(savedId);
+      syncAvailableWorkerQrs();
+    }
+  }, [
+    applyAccountPayload,
+    syncAccountFromDb,
+    syncAvailableWorkerQrs,
+    triggerToast,
+  ]);
+
+  useEffect(() => {
+    if (showReceiptScannerModal) {
+      syncAvailableWorkerQrs();
+    }
+  }, [showReceiptScannerModal, syncAvailableWorkerQrs]);
+
+  const stopQrCamera = useCallback(() => {
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current = null;
+    }
+    setIsCameraActive(false);
+  }, []);
+
+  useEffect(() => {
+    if (!showReceiptScannerModal) {
+      stopQrCamera();
+    }
+  }, [showReceiptScannerModal, stopQrCamera]);
+
+  useEffect(() => {
+    return () => stopQrCamera();
+  }, [stopQrCamera]);
 
   const currentAttraction = ATTRACTIONS[selectedAttractionId];
   const currentTicket =
@@ -219,49 +470,88 @@ export default function VisitorPortalApp() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const openTicketForAttraction = (attractionId: AttractionId) => {
+  const openTicketForAttraction = async (attractionId: AttractionId) => {
     const found = tickets.find((t) => t.attractionId === attractionId);
     if (found) {
       setSelectedTicketId(found.id);
       setSelectedAttractionId(attractionId);
       setActiveScreen("ticket-queue");
-    } else {
-      const attr = ATTRACTIONS[attractionId];
-      const newTkt: VisitorTicket = {
-        id: `tkt-${attractionId}-${Date.now()}`,
-        receiptId: activeReceiptId,
-        attractionId,
-        attractionName: attr.name,
-        cardThumbImage: attr.cardImage,
-        myTicketsIllustration: attr.ticketIllustration,
-        myTicketsBg: attr.ticketCardBg,
-        guestSummaryHome: "1 Person",
-        guestSummaryMyTickets: "1 Ticket • 1 Guest",
-        holderName: holderDisplayName,
-        membersLabel: "1 Member",
-        validDateLine1: "valid on 31 oct 2026",
-        validDateLine2: "08.00 - 18.00",
-        includes: [
-          "1 guest admission",
-          "Standard attraction access",
-          "Valid on Selected Date",
-        ],
-        queueStatus: "not_joined",
-        queuePosition: "A2N14",
-        queueNodes: ["A2N10", "A2N11", "A2N12", "A2N13", "YOU"],
-        estimatedBoardingTime: "16:45",
-        joinedQueueAt: "15.30",
-      };
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+
+    // Paid rides (SQP Express & Roll Glider) use Worker QR claim or POS receipt
+    if (attractionId === "sqp-express" || attractionId === "adventure-ropes") {
+      setScannerMode("qr-claim");
+      setQrScanError(null);
+      setShowReceiptScannerModal(true);
+      triggerToast(
+        `Scan QR dari Petugas untuk klaim tiket ${ATTRACTIONS[attractionId].name}!`
+      );
+      return;
+    }
+
+    // Free Pass: Wall Climbing can be claimed directly to the active account in DB
+    const attr = ATTRACTIONS[attractionId];
+    const newTkt: VisitorTicket = {
+      id: `tkt-${attractionId}-${Date.now()}`,
+      receiptId: `FREE-${String(Date.now()).slice(-6)}`,
+      attractionId,
+      attractionName: attr.name,
+      cardThumbImage: attr.cardImage,
+      myTicketsIllustration: attr.ticketIllustration,
+      myTicketsBg: attr.ticketCardBg,
+      guestSummaryHome: "1 Person",
+      guestSummaryMyTickets: "1 Ticket • 1 Guest",
+      holderName: holderDisplayName,
+      membersLabel: "1 Member",
+      validDateLine1: "valid today",
+      validDateLine2: "08.00 - 18.00",
+      includes: [
+        "1 climber free admission",
+        "Full safety harness & helmet rental",
+        "Saved to Visitor Account",
+      ],
+      queueStatus: "not_joined",
+      queuePosition: "W1N08",
+      queueNodes: ["W1N04", "W1N05", "W1N06", "W1N07", "YOU"],
+      estimatedBoardingTime: "16:45",
+      joinedQueueAt: "15.30",
+    };
+
+    try {
+      const res = await fetch("/api/db/tickets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add-tickets",
+          accountId: currentAccountId,
+          tickets: [newTkt],
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        applyAccountPayload(data);
+        if (data.activeTickets?.[0]) {
+          setSelectedTicketId(data.activeTickets[0].id);
+        }
+      } else {
+        setTickets((prev) => [newTkt, ...prev]);
+        setSelectedTicketId(newTkt.id);
+      }
+    } catch {
       setTickets((prev) => [newTkt, ...prev]);
       setSelectedTicketId(newTkt.id);
-      setSelectedAttractionId(attractionId);
-      setActiveScreen("ticket-queue");
-      triggerToast(`Claimed ticket for ${attr.name}!`);
     }
+
+    setSelectedAttractionId(attractionId);
+    setActiveScreen("ticket-queue");
+    triggerToast(`Free ticket ${attr.name} disimpan ke akun!`);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const handleJoinQueue = (ticketId: string) => {
+  const handleJoinQueue = async (ticketId: string) => {
+    const tkt = tickets.find((t) => t.id === ticketId);
     setTickets((prev) =>
       prev.map((t) =>
         t.id === ticketId
@@ -273,7 +563,22 @@ export default function VisitorPortalApp() {
           : t
       )
     );
-    const tkt = tickets.find((t) => t.id === ticketId);
+    try {
+      const res = await fetch("/api/db/tickets", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: currentAccountId,
+          ticketId,
+          action: "join_queue",
+        }),
+      });
+      if (res.ok) {
+        applyAccountPayload(await res.json());
+      }
+    } catch {
+      // Optimistic fallback already applied
+    }
     triggerToast(
       `Joined virtual queue for ${tkt?.attractionName ?? "Attraction"}! Position: ${
         tkt?.queuePosition ?? "B2N10"
@@ -281,7 +586,7 @@ export default function VisitorPortalApp() {
     );
   };
 
-  const handleToggleQueueStateForDemo = (ticketId: string) => {
+  const handleToggleQueueStateForDemo = async (ticketId: string) => {
     setTickets((prev) =>
       prev.map((t) =>
         t.id === ticketId
@@ -293,34 +598,167 @@ export default function VisitorPortalApp() {
           : t
       )
     );
+    try {
+      const res = await fetch("/api/db/tickets", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: currentAccountId,
+          ticketId,
+          action: "toggle_queue",
+        }),
+      });
+      if (res.ok) {
+        applyAccountPayload(await res.json());
+      }
+    } catch {
+      // Optimistic fallback already applied
+    }
   };
 
-  const handleConfirmUseTicket = () => {
+  const handleConfirmUseTicket = async () => {
     if (!currentTicket) return;
     setShowUseTicketModal(false);
 
-    const usedTicket: VisitorTicket = {
-      ...currentTicket,
-      id: `hist-${currentTicket.id}-${Date.now()}`,
-      queueStatus: "used",
-      usedDateText: "25 Oct 2026",
-    };
+    try {
+      const res = await fetch("/api/db/tickets", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountId: currentAccountId,
+          ticketId: currentTicket.id,
+          action: "use_ticket",
+        }),
+      });
+      if (res.ok) {
+        applyAccountPayload(await res.json());
+      } else {
+        const usedTicket: VisitorTicket = {
+          ...currentTicket,
+          queueStatus: "used",
+          usedDateText: "Today",
+        };
+        setHistoryTickets((prev) => [usedTicket, ...prev]);
+        setTickets((prev) => prev.filter((t) => t.id !== currentTicket.id));
+      }
+    } catch {
+      const usedTicket: VisitorTicket = {
+        ...currentTicket,
+        queueStatus: "used",
+        usedDateText: "Today",
+      };
+      setHistoryTickets((prev) => [usedTicket, ...prev]);
+      setTickets((prev) => prev.filter((t) => t.id !== currentTicket.id));
+    }
 
-    setHistoryTickets((prev) => [usedTicket, ...prev]);
-    setTickets((prev) => prev.filter((t) => t.id !== currentTicket.id));
     setTicketsTab("my-history");
     setActiveScreen("tickets");
     triggerToast(
-      `Ticket for ${currentTicket.attractionName} marked as Used!`
+      `Ticket for ${currentTicket.attractionName} marked as Used in Database!`
     );
   };
 
-  // Auth Handlers
-  const handleSignInWithGoogleAccount = (account: {
+  // Auth & Database Account Handlers
+  const handleSwitchToDbAccount = async (accountId: string) => {
+    setAuthFormError(null);
+    try {
+      const res = await fetch("/api/db/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "switch", accountId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthFormError(data.error || "Gagal masuk ke akun.");
+        return;
+      }
+      applyAccountPayload(data);
+      setShowGoogleOAuthChooser(false);
+      setActiveScreen("home");
+      triggerToast(
+        data.account?.isGuest
+          ? "Continuing as Guest"
+          : `Signed in as ${data.account?.fullName || data.account?.username}`
+      );
+    } catch {
+      setAuthFormError("Tidak dapat terhubung ke database.");
+    }
+  };
+
+  const handleLoginWithCredentials = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthFormError(null);
+    try {
+      const res = await fetch("/api/db/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "login",
+          identifier: loginForm.identifier,
+          password: loginForm.password,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthFormError(data.error || "Username/email atau password salah.");
+        return;
+      }
+      applyAccountPayload(data);
+      setLoginForm({ identifier: "", password: "" });
+      setActiveScreen("home");
+      triggerToast(`Welcome back, ${data.account?.username}!`);
+    } catch {
+      setAuthFormError("Gagal terhubung ke database.");
+    }
+  };
+
+  const handleRegisterNewAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthFormError(null);
+    try {
+      const res = await fetch("/api/db/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "register",
+          username: registerForm.username,
+          fullName: registerForm.fullName || registerForm.username,
+          email: registerForm.email,
+          phone: registerForm.phone,
+          password: registerForm.password,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthFormError(data.error || "Registrasi gagal.");
+        return;
+      }
+      applyAccountPayload(data);
+      setRegisteredAccountName(data.account?.username || registerForm.username);
+      setRegisterForm({
+        username: "",
+        fullName: "",
+        email: "",
+        phone: "",
+        password: "",
+      });
+      setAuthViewTab("register-success");
+      triggerToast(`Akun ${data.account?.username} ditambahkan ke database!`);
+    } catch {
+      setAuthFormError("Gagal terhubung ke database.");
+    }
+  };
+
+  const handleSignInWithGoogleAccount = async (account: {
+    id?: string;
     username: string;
     fullName: string;
     email: string;
   }) => {
+    if (account.id) {
+      await handleSwitchToDbAccount(account.id);
+      return;
+    }
     setAuthMode("google");
     setUserProfile((prev) => ({
       ...prev,
@@ -333,11 +771,183 @@ export default function VisitorPortalApp() {
     triggerToast(`Signed in with Google as ${account.fullName}`);
   };
 
-  const handleContinueAsGuest = () => {
-    setAuthMode("guest");
-    setShowGoogleOAuthChooser(false);
-    setActiveScreen("home");
-    triggerToast("Continuing as Guest");
+  const handleContinueAsGuest = async () => {
+    await handleSwitchToDbAccount("acc-guest");
+  };
+
+  // Worker QR Claim Handlers (SQP Express & Roll Glider)
+  const handleClaimWorkerQrCode = async (rawCode?: string) => {
+    const rawInput = rawCode ?? qrCodeInput;
+    const code = extractClaimCodeFromQrPayload(rawInput) ?? "";
+    if (!code) {
+      setQrScanError("Masukkan atau pindai kode QR tiket terlebih dahulu.");
+      return;
+    }
+    setQrScanError(null);
+    setIsClaimingQr(true);
+    try {
+      const res = await fetch("/api/db/tickets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "claim-qr",
+          accountId: currentAccountId,
+          claimCode: code,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setQrScanError(data.error || "Gagal mengklaim QR tiket.");
+        return;
+      }
+
+      applyAccountPayload(data);
+      if (data.workerQrs) {
+        setAvailableWorkerQrs(data.workerQrs);
+      }
+      if (data.ticket) {
+        setSelectedTicketId(data.ticket.id);
+        setSelectedAttractionId(data.ticket.attractionId);
+      }
+      stopQrCamera();
+      setQrCodeInput("");
+      setQrScanMethodNote("");
+      setShowReceiptScannerModal(false);
+      setTicketsTab("my-tickets");
+      setActiveScreen("tickets");
+      triggerToast(
+        `Tiket ${data.ticket?.attractionName ?? ""} (${code}) ditambahkan ke akun ${holderDisplayName}!`
+      );
+    } catch {
+      setQrScanError("Gagal terhubung ke server database.");
+    } finally {
+      setIsClaimingQr(false);
+    }
+  };
+
+  const handleQrImageUpload = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setQrScanError(null);
+    setQrScanMethodNote("Memindai gambar QR Code...");
+    try {
+      const decoded = await decodeUploadedQrImage(file);
+      if (decoded.claimCode) {
+        setQrCodeInput(decoded.claimCode);
+        setQrScanMethodNote(`Terdeteksi (${decoded.method}): ${decoded.claimCode}`);
+        await handleClaimWorkerQrCode(decoded.claimCode);
+      } else {
+        setQrScanMethodNote("");
+        setQrScanError(
+          "QR Code tidak terbaca pada gambar. Coba upload PNG QR dari halaman /worker atau masukkan kode SQP-CLAIM-... secara manual."
+        );
+      }
+    } catch {
+      setQrScanMethodNote("");
+      setQrScanError("Gagal membaca file gambar QR.");
+    }
+  };
+
+  const handleStartLiveQrCamera = async () => {
+    setQrScanError(null);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setQrScanError(
+        "Kamera live tidak tersedia di HTTP non-HTTPS atau browser ini. Scan langsung memakai kamera bawaan HP ke QR di /worker, atau gunakan Upload Gambar QR."
+      );
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+      });
+      cameraStreamRef.current = stream;
+      setIsCameraActive(true);
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => undefined);
+        }
+      }, 60);
+
+      type BarcodeDetectorCtor = new (opts: { formats: string[] }) => {
+        detect: (src: ImageBitmapSource) => Promise<{ rawValue?: string }[]>;
+      };
+      const win = window as unknown as {
+        BarcodeDetector?: BarcodeDetectorCtor;
+      };
+      const detector =
+        typeof win.BarcodeDetector === "function"
+          ? new win.BarcodeDetector({ formats: ["qr_code"] })
+          : null;
+
+      setQrScanMethodNote(
+        "Kamera aktif (jsQR scanner siap — arahkan kamera ke QR Code pada /worker)."
+      );
+
+      const scanCanvas = document.createElement("canvas");
+      const scanCtx = scanCanvas.getContext("2d", {
+        willReadFrequently: true,
+      });
+
+      const scanFrame = async () => {
+        if (!cameraStreamRef.current || !videoRef.current) return;
+        try {
+          if (
+            videoRef.current.readyState >= 2 &&
+            videoRef.current.videoWidth > 0 &&
+            videoRef.current.videoHeight > 0
+          ) {
+            const vw = videoRef.current.videoWidth;
+            const vh = videoRef.current.videoHeight;
+            const scale = Math.min(1, 720 / Math.max(vw, vh));
+            const cw = Math.max(1, Math.round(vw * scale));
+            const ch = Math.max(1, Math.round(vh * scale));
+            if (scanCanvas.width !== cw || scanCanvas.height !== ch) {
+              scanCanvas.width = cw;
+              scanCanvas.height = ch;
+            }
+
+            let rawPayload: string | null = null;
+            if (scanCtx) {
+              scanCtx.drawImage(videoRef.current, 0, 0, cw, ch);
+              const imageData = scanCtx.getImageData(0, 0, cw, ch);
+              rawPayload = decodeQrFromImageData(imageData);
+            }
+
+            if (!rawPayload && detector) {
+              const found = await detector.detect(videoRef.current);
+              rawPayload =
+                found.find((f) => Boolean(f.rawValue))?.rawValue ?? null;
+            }
+
+            if (rawPayload) {
+              const extractedCode =
+                extractClaimCodeFromQrPayload(rawPayload) ||
+                rawPayload.trim().toUpperCase();
+              setQrCodeInput(extractedCode);
+              setQrScanMethodNote(
+                `QR terdeteksi dari kamera: ${extractedCode}`
+              );
+              stopQrCamera();
+              await handleClaimWorkerQrCode(extractedCode);
+              return;
+            }
+          }
+        } catch {
+          // Continue polling
+        }
+        if (cameraStreamRef.current) {
+          setTimeout(scanFrame, 280);
+        }
+      };
+      setTimeout(scanFrame, 350);
+    } catch {
+      setQrScanError(
+        "Izin kamera ditolak atau HTTP non-HTTPS memblokir kamera. Scan langsung memakai kamera bawaan HP, Upload Foto QR, atau pilih dari daftar QR aktif."
+      );
+    }
   };
 
   // Receipt VLM Scan Handlers
@@ -360,7 +970,7 @@ export default function VisitorPortalApp() {
       setLastScanResult(null);
       const result = await scanReceiptWithBrowserVlm({
         uploadedImage: uploadedObj,
-        holderDisplayName: authMode === "guest" ? "Guest" : "James",
+        holderDisplayName,
         onStep: (step) => setVlmStepText(step),
       });
       setLastScanResult(result);
@@ -379,7 +989,7 @@ export default function VisitorPortalApp() {
       const result = await scanReceiptWithBrowserVlm({
         preset: uploadedReceiptPreview ? undefined : selectedPresetReceipt,
         uploadedImage: uploadedReceiptPreview || undefined,
-        holderDisplayName: authMode === "guest" ? "Guest" : "James",
+        holderDisplayName,
         onStep: (step) => setVlmStepText(step),
       });
       setLastScanResult(result);
@@ -389,19 +999,38 @@ export default function VisitorPortalApp() {
     }
   };
 
-  const handleApplyScannedReceiptTickets = () => {
+  const handleApplyScannedReceiptTickets = async () => {
     if (!lastScanResult) return;
     setActiveReceiptId(lastScanResult.receiptId);
-    setTickets(lastScanResult.tickets);
-    if (lastScanResult.tickets[0]) {
-      setSelectedTicketId(lastScanResult.tickets[0].id);
-      setSelectedAttractionId(lastScanResult.tickets[0].attractionId);
+    try {
+      const res = await fetch("/api/db/tickets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add-tickets",
+          accountId: currentAccountId,
+          tickets: lastScanResult.tickets,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        applyAccountPayload(data);
+        if (data.activeTickets?.[0]) {
+          setSelectedTicketId(data.activeTickets[0].id);
+          setSelectedAttractionId(data.activeTickets[0].attractionId);
+        }
+      } else {
+        setTickets((prev) => [...lastScanResult.tickets, ...prev]);
+      }
+    } catch {
+      setTickets((prev) => [...lastScanResult.tickets, ...prev]);
     }
+
     setShowReceiptScannerModal(false);
     setTicketsTab("my-tickets");
     setActiveScreen("tickets");
     triggerToast(
-      `Loaded ${lastScanResult.tickets.length} tickets from Receipt ${lastScanResult.receiptId}!`
+      `Saved ${lastScanResult.tickets.length} tickets from Receipt ${lastScanResult.receiptId} to Database!`
     );
   };
 
@@ -413,129 +1042,476 @@ export default function VisitorPortalApp() {
       : "home";
 
   // ============================================================================
-  // 0. LOGIN / WELCOME PREVIEW SCREEN (Google OAuth Preview + Guest without ID)
+  // 0. LOGIN / REGISTER / ACCOUNT DATABASE SCREEN (Figma 404:630, 404:807, 404:909, 404:1097)
   // ============================================================================
-  const renderLoginScreen = () => (
-    <div className="w-full pb-28 max-w-md mx-auto">
-      <div className="relative w-full overflow-hidden md:rounded-[32px] bg-[#FFF4DC] md:shadow-[0_12px_36px_rgba(38,59,41,0.16)] md:border md:border-[#E8EFD9] md:mt-4">
-        {/* Top Park Photo */}
-        <div className="relative h-[300px] w-full overflow-hidden">
-          <img
-            src="/assets/visitor/hero-bg.png"
-            alt="Scientia Square Park"
-            className="w-full h-full object-cover"
-          />
-          <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-black/10 to-transparent" />
-          <div className="absolute top-8 left-6 right-6 text-white">
-            <span className="inline-block bg-[#4D8B45]/90 backdrop-blur-xs text-[#FFF4DC] font-bold text-[11px] uppercase tracking-wider px-3 py-1 rounded-full">
-              Scientia Square Park
-            </span>
-            <h1 className="font-extrabold text-[28px] leading-tight mt-2 drop-shadow-md">
-              Let&apos;s Explore SQP!
-            </h1>
-            <p className="text-[14px] text-white/95 font-medium mt-0.5 drop-shadow">
-              Virtual Queue &amp; Digital Attraction Passes
-            </p>
-          </div>
+  const renderLoginScreen = () => {
+    const nonGuestAccounts = dbAccounts.filter((a) => !a.isGuest);
+    const hasMinLen = registerForm.password.length >= 8;
+    const hasAlphaNum =
+      /[a-zA-Z]/.test(registerForm.password) &&
+      /\d/.test(registerForm.password);
 
-          {/* Convex Cream Arch at Bottom of Hero Image */}
-          <div className="absolute -bottom-8 left-[-12%] right-[-12%] h-16 bg-[#FFF4DC] rounded-t-[50%]" />
-        </div>
-
-        {/* Login Sheet Body */}
-        <div className="relative px-7 pt-2 pb-9 text-center">
-          <div className="w-14 h-14 rounded-2xl bg-[#4D8B45] text-[#F2C94C] font-extrabold text-[20px] flex items-center justify-center mx-auto shadow-md">
-            SQP
-          </div>
-
-          <h2 className="font-extrabold text-[26px] text-[#263B29] mt-3">
-            Welcome!
-          </h2>
-          <p className="text-[14px] text-[#6B665C] mt-1 max-w-[260px] mx-auto leading-snug">
-            Sign in to manage your virtual queue and attraction tickets, or
-            continue directly as a guest.
-          </p>
-
-          {/* Primary Action 1: Continue with Google (OAuth Preview) */}
-          <div className="mt-6 space-y-3">
-            <button
-              type="button"
-              onClick={() => setShowGoogleOAuthChooser(true)}
-              className="w-full h-[54px] bg-white hover:bg-[#F8FAF6] active:scale-[0.99] border-2 border-[#D8E7D2] rounded-[18px] px-4 flex items-center justify-center gap-3 shadow-xs transition-all cursor-pointer"
-            >
-              <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24">
-                <path
-                  fill="#4285F4"
-                  d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"
-                />
-                <path
-                  fill="#34A853"
-                  d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z"
-                />
-                <path
-                  fill="#FBBC05"
-                  d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.13-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z"
-                />
-                <path
-                  fill="#EA4335"
-                  d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
-                />
-              </svg>
-              <div className="text-left">
-                <p className="font-bold text-[14px] text-[#263B29] leading-tight">
-                  Continue with Google
-                </p>
-                <p className="text-[11px] text-[#6B665C]">
-                  Sync tickets &amp; queue alerts across devices
+    return (
+      <div className="w-full pb-28 max-w-md mx-auto">
+        <div className="relative w-full overflow-hidden md:rounded-[32px] bg-[#FFF4DC] md:shadow-[0_12px_36px_rgba(38,59,41,0.16)] md:border md:border-[#E8EFD9] md:mt-4">
+          {/* Top Park Photo */}
+          <div className="relative h-[255px] w-full overflow-hidden">
+            <img
+              src="/assets/visitor/hero-bg.png"
+              alt="Scientia Square Park"
+              className="w-full h-full object-cover"
+            />
+            <div className="absolute inset-0 bg-gradient-to-b from-black/40 via-black/10 to-transparent" />
+            <div className="absolute top-7 left-6 right-6 text-white flex items-start justify-between gap-2">
+              <div>
+                <span className="inline-block bg-[#4D8B45]/90 backdrop-blur-xs text-[#FFF4DC] font-bold text-[11px] uppercase tracking-wider px-3 py-1 rounded-full">
+                  Scientia Square Park
+                </span>
+                <h1 className="font-extrabold text-[26px] leading-tight mt-2 drop-shadow-md">
+                  Let&apos;s Explore SQP!
+                </h1>
+                <p className="text-[13px] text-white/95 font-medium mt-0.5 drop-shadow">
+                  Database Akun &amp; Klaim Tiket QR
                 </p>
               </div>
-            </button>
-
-            {/* Primary Action 2: Continue as Guest (No Guest ID shown) */}
-            <button
-              type="button"
-              onClick={handleContinueAsGuest}
-              className="w-full h-[54px] bg-[#4D8B45] hover:bg-[#3d7236] active:scale-[0.99] text-white rounded-[18px] px-4 flex items-center justify-center gap-3 shadow-sm transition-all cursor-pointer"
-            >
-              <svg
-                className="w-5 h-5 text-[#F2C94C] shrink-0"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                strokeWidth={2.2}
+              <Link
+                href="/worker"
+                className="bg-white/90 hover:bg-white text-[#183F2A] font-extrabold text-[11px] px-3 py-1.5 rounded-full shadow-md shrink-0"
               >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
-                />
-              </svg>
-              <div className="text-left">
-                <p className="font-bold text-[15px] text-white leading-tight">
-                  Continue as Guest
-                </p>
-                <p className="text-[11px] text-[#E8EFD9]">
-                  Instant park access • Scan receipt to load tickets
-                </p>
-              </div>
-            </button>
+                Petugas QR →
+              </Link>
+            </div>
+
+            {/* Convex Cream Arch at Bottom of Hero Image */}
+            <div className="absolute -bottom-8 left-[-12%] right-[-12%] h-16 bg-[#FFF4DC] rounded-t-[50%]" />
           </div>
 
-          {/* Scan Receipt Shortcut on Login */}
-          <div className="mt-5 pt-4 border-t border-[#E8EFD9]">
-            <button
-              type="button"
-              onClick={() => setShowReceiptScannerModal(true)}
-              className="inline-flex items-center gap-2 text-[13px] font-bold text-[#4D8B45] hover:underline cursor-pointer"
-            >
-              <span>Have a printed park receipt? Scan Receipt with AI</span>
-              <span>→</span>
-            </button>
+          {/* Auth Mode Mode Pill Switcher */}
+          <div className="relative px-6 pt-1 pb-8">
+            <div className="mx-auto w-full bg-[#E8EFD9] rounded-full p-1 flex items-center mb-5 text-[12.5px] font-bold">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthFormError(null);
+                  setAuthViewTab("welcome");
+                }}
+                className={`flex-1 py-2 rounded-full transition-all cursor-pointer ${
+                  authViewTab === "welcome"
+                    ? "bg-[#4D8B45] text-white shadow-xs"
+                    : "text-[#263B29]"
+                }`}
+              >
+                Akun &amp; Guest
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthFormError(null);
+                  setAuthViewTab("credentials");
+                }}
+                className={`flex-1 py-2 rounded-full transition-all cursor-pointer ${
+                  authViewTab === "credentials"
+                    ? "bg-[#4D8B45] text-white shadow-xs"
+                    : "text-[#263B29]"
+                }`}
+              >
+                Login
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthFormError(null);
+                  setAuthViewTab("register");
+                }}
+                className={`flex-1 py-2 rounded-full transition-all cursor-pointer ${
+                  authViewTab === "register" ||
+                  authViewTab === "register-success"
+                    ? "bg-[#4D8B45] text-white shadow-xs"
+                    : "text-[#263B29]"
+                }`}
+              >
+                Daftar Baru
+              </button>
+            </div>
+
+            {authViewTab === "welcome" && (
+              <div className="text-center space-y-4">
+                <div>
+                  <h2 className="font-extrabold text-[24px] text-[#263B29]">
+                    Selamat Datang!
+                  </h2>
+                  <p className="text-[13px] text-[#6B665C] mt-1">
+                    Pilih akun di database, buat akun baru, atau masuk sebagai
+                    Guest.
+                  </p>
+                </div>
+
+                {/* Live Database Accounts Quick Switcher */}
+                <div className="bg-white rounded-[20px] border border-[#D8E7D2] p-3.5 text-left space-y-2">
+                  <div className="flex items-center justify-between px-1">
+                    <span className="text-[11px] font-extrabold uppercase tracking-wider text-[#6B665C]">
+                      Akun Terdaftar di Database ({nonGuestAccounts.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setAuthViewTab("register")}
+                      className="text-[11.5px] font-bold text-[#4D8B45] hover:underline cursor-pointer"
+                    >
+                      + Tambah Akun
+                    </button>
+                  </div>
+
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    {nonGuestAccounts.map((acc) => {
+                      const isCurrent =
+                        authMode === "google" && currentAccountId === acc.id;
+                      return (
+                        <button
+                          key={acc.id}
+                          type="button"
+                          onClick={() => handleSwitchToDbAccount(acc.id)}
+                          className={`w-full px-3 py-2.5 rounded-2xl border flex items-center justify-between gap-2 transition-colors text-left cursor-pointer ${
+                            isCurrent
+                              ? "bg-[#EDF6E8] border-[#4D8B45]"
+                              : "bg-[#F9FBF7] hover:bg-[#EDF6E8]/60 border-[#E8EFD9]"
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <p className="font-bold text-[13.5px] text-[#263B29] truncate">
+                              {acc.username}{" "}
+                              <span className="font-normal text-[#6B665C]">
+                                ({acc.fullName})
+                              </span>
+                            </p>
+                            <p className="text-[11px] text-[#6B665C] truncate">
+                              {acc.email}
+                            </p>
+                          </div>
+                          <span className="bg-[#4D8B45] text-white font-bold text-[10.5px] px-2.5 py-1 rounded-full shrink-0">
+                            {acc.activeTicketCount} Tiket
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="space-y-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setShowGoogleOAuthChooser(true)}
+                    className="w-full h-[50px] bg-white hover:bg-[#F8FAF6] border-2 border-[#D8E7D2] rounded-[16px] px-4 flex items-center justify-center gap-3 shadow-2xs cursor-pointer"
+                  >
+                    <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24">
+                      <path
+                        fill="#4285F4"
+                        d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.13-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
+                      />
+                    </svg>
+                    <span className="font-bold text-[14px] text-[#263B29]">
+                      Continue with Google (Preview)
+                    </span>
+                  </button>
+
+                  {/* Guest mode — NEVER displays a Guest ID */}
+                  <button
+                    type="button"
+                    onClick={handleContinueAsGuest}
+                    className="w-full h-[50px] bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[14.5px] rounded-[16px] px-4 flex items-center justify-center gap-2.5 shadow-sm cursor-pointer"
+                  >
+                    <span>Continue as Guest</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {authViewTab === "credentials" && (
+              <form
+                onSubmit={handleLoginWithCredentials}
+                className="space-y-3.5 text-left"
+              >
+                <div>
+                  <h2 className="font-extrabold text-[22px] text-[#263B29]">
+                    Login Akun
+                  </h2>
+                  <p className="text-[12.5px] text-[#6B665C]">
+                    Masuk menggunakan username/email &amp; password (default
+                    seed pass: <code>sqp12345</code>).
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-[12px] font-bold text-[#263B29] mb-1">
+                    Username atau Email
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={loginForm.identifier}
+                    onChange={(e) =>
+                      setLoginForm({ ...loginForm, identifier: e.target.value })
+                    }
+                    placeholder="Kevcak atau kevinCakrun@gmail.com"
+                    className="w-full h-[46px] px-3.5 rounded-[14px] bg-white border border-[#D8E7D2] text-[#263B29] font-semibold text-[14px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[12px] font-bold text-[#263B29] mb-1">
+                    Password
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={loginForm.password}
+                    onChange={(e) =>
+                      setLoginForm({ ...loginForm, password: e.target.value })
+                    }
+                    placeholder="••••••••"
+                    className="w-full h-[46px] px-3.5 rounded-[14px] bg-white border border-[#D8E7D2] text-[#263B29] font-semibold text-[14px]"
+                  />
+                </div>
+
+                {authFormError && (
+                  <p className="text-[12.5px] font-bold text-[#C94B3C] bg-[#FDECE9] px-3 py-2 rounded-xl">
+                    {authFormError}
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  className="w-full h-[48px] bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[15px] rounded-[14px] cursor-pointer"
+                >
+                  Login
+                </button>
+              </form>
+            )}
+
+            {authViewTab === "register" && (
+              <form
+                onSubmit={handleRegisterNewAccount}
+                className="space-y-3 text-left"
+              >
+                <div>
+                  <h2 className="font-extrabold text-[22px] text-[#263B29]">
+                    Buat Akun Baru
+                  </h2>
+                  <p className="text-[12.5px] text-[#6B665C]">
+                    Akun baru tersimpan di database untuk menerima tiket QR dari
+                    petugas.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11.5px] font-bold text-[#263B29] mb-1">
+                      Username *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={registerForm.username}
+                      onChange={(e) =>
+                        setRegisterForm({
+                          ...registerForm,
+                          username: e.target.value,
+                        })
+                      }
+                      placeholder="BudiSQP"
+                      className="w-full h-[44px] px-3 rounded-[12px] bg-white border border-[#D8E7D2] text-[#263B29] font-semibold text-[13.5px]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11.5px] font-bold text-[#263B29] mb-1">
+                      Nama Lengkap
+                    </label>
+                    <input
+                      type="text"
+                      value={registerForm.fullName}
+                      onChange={(e) =>
+                        setRegisterForm({
+                          ...registerForm,
+                          fullName: e.target.value,
+                        })
+                      }
+                      placeholder="Budi Santoso"
+                      className="w-full h-[44px] px-3 rounded-[12px] bg-white border border-[#D8E7D2] text-[#263B29] font-semibold text-[13.5px]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11.5px] font-bold text-[#263B29] mb-1">
+                    Email *
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={registerForm.email}
+                    onChange={(e) =>
+                      setRegisterForm({
+                        ...registerForm,
+                        email: e.target.value,
+                      })
+                    }
+                    placeholder="budi@example.com"
+                    className="w-full h-[44px] px-3 rounded-[12px] bg-white border border-[#D8E7D2] text-[#263B29] font-semibold text-[13.5px]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11.5px] font-bold text-[#263B29] mb-1">
+                    No Telepon (+62)
+                  </label>
+                  <div className="flex items-center bg-white border border-[#D8E7D2] rounded-[12px] overflow-hidden h-[44px]">
+                    <span className="px-3 font-bold text-[13px] text-[#263B29] border-r border-[#E8EFD9]">
+                      +62
+                    </span>
+                    <input
+                      type="text"
+                      value={registerForm.phone}
+                      onChange={(e) =>
+                        setRegisterForm({
+                          ...registerForm,
+                          phone: e.target.value,
+                        })
+                      }
+                      placeholder="812-3456-7890"
+                      className="flex-1 px-3 text-[#263B29] font-semibold text-[13.5px] outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[11.5px] font-bold text-[#263B29] mb-1">
+                    Password *
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    value={registerForm.password}
+                    onChange={(e) =>
+                      setRegisterForm({
+                        ...registerForm,
+                        password: e.target.value,
+                      })
+                    }
+                    placeholder="Minimal 8 karakter + huruf & angka"
+                    className="w-full h-[44px] px-3 rounded-[12px] bg-white border border-[#D8E7D2] text-[#263B29] font-semibold text-[13.5px]"
+                  />
+                  <div className="mt-1.5 space-y-0.5 text-[11.5px]">
+                    <p
+                      className={
+                        hasMinLen
+                          ? "text-[#4D8B45] font-bold"
+                          : "text-[#6B665C]"
+                      }
+                    >
+                      {hasMinLen ? "✓" : "○"} Minimal 8 karakter
+                    </p>
+                    <p
+                      className={
+                        hasAlphaNum
+                          ? "text-[#4D8B45] font-bold"
+                          : "text-[#6B665C]"
+                      }
+                    >
+                      {hasAlphaNum ? "✓" : "○"} Mengandung huruf dan angka
+                    </p>
+                  </div>
+                </div>
+
+                {authFormError && (
+                  <p className="text-[12.5px] font-bold text-[#C94B3C] bg-[#FDECE9] px-3 py-2 rounded-xl">
+                    {authFormError}
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  className="w-full h-[48px] bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[15px] rounded-[14px] cursor-pointer"
+                >
+                  Daftar &amp; Simpan ke Database
+                </button>
+              </form>
+            )}
+
+            {authViewTab === "register-success" && (
+              <div className="text-center py-4 space-y-4">
+                <div className="w-16 h-16 rounded-full bg-[#EDF6E8] text-[#4D8B45] font-extrabold text-[30px] flex items-center justify-center mx-auto">
+                  ✓
+                </div>
+                <div>
+                  <h2 className="font-extrabold text-[24px] text-[#263B29]">
+                    Registrasi Berhasil!
+                  </h2>
+                  <p className="text-[13.5px] text-[#6B665C] mt-1 max-w-[280px] mx-auto">
+                    Akun <strong>{registeredAccountName}</strong> sudah tersimpan
+                    di database (0 tiket). Pindai QR dari Petugas untuk
+                    menambahkan tiket!
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setScannerMode("qr-claim");
+                      setShowReceiptScannerModal(true);
+                    }}
+                    className="w-full h-[48px] bg-[#F2C94C] hover:bg-[#e5ba38] text-[#263B29] font-extrabold text-[14.5px] rounded-[14px] cursor-pointer"
+                  >
+                    📷 Scan QR Tiket Petugas Sekarang
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthViewTab("welcome");
+                      setActiveScreen("home");
+                    }}
+                    className="w-full h-[46px] bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[14.5px] rounded-[14px] cursor-pointer"
+                  >
+                    Masuk ke Beranda Visitor →
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Scan QR / Receipt Shortcut on Login */}
+            <div className="mt-5 pt-4 border-t border-[#E8EFD9] flex items-center justify-between gap-2 text-[12.5px]">
+              <button
+                type="button"
+                onClick={() => {
+                  setScannerMode("qr-claim");
+                  setShowReceiptScannerModal(true);
+                }}
+                className="font-bold text-[#4D8B45] hover:underline cursor-pointer"
+              >
+                📷 Scan QR Klaim Tiket
+              </button>
+              <Link
+                href="/worker"
+                className="font-bold text-[#F28C28] hover:underline"
+              >
+                Buka Worker QR (/worker) →
+              </Link>
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   // ============================================================================
   // 1. HOME SCREEN (Exact Figma Node 28:3584 / steps/123/media_0.png)
@@ -581,10 +1557,13 @@ export default function VisitorPortalApp() {
           </h2>
           <button
             type="button"
-            onClick={() => setShowReceiptScannerModal(true)}
+            onClick={() => {
+              setScannerMode("qr-claim");
+              setShowReceiptScannerModal(true);
+            }}
             className="inline-flex items-center gap-1.5 bg-[#E8EFD9] hover:bg-[#dce7c6] text-[#4D8B45] font-bold text-[11px] px-3 py-1 rounded-full transition-colors cursor-pointer"
           >
-            <span>📷 Scan Receipt</span>
+            <span>📷 Scan QR / Receipt</span>
           </button>
         </div>
 
@@ -701,10 +1680,13 @@ export default function VisitorPortalApp() {
               </p>
               <button
                 type="button"
-                onClick={() => setShowReceiptScannerModal(true)}
+                onClick={() => {
+                  setScannerMode("qr-claim");
+                  setShowReceiptScannerModal(true);
+                }}
                 className="mt-3 bg-[#4D8B45] text-white font-bold text-[12px] px-4 py-2 rounded-full cursor-pointer"
               >
-                Scan Receipt
+                Scan QR / Receipt
               </button>
             </div>
           ) : (
@@ -1164,6 +2146,41 @@ export default function VisitorPortalApp() {
   // ============================================================================
   const renderTicketQueueScreen = () => {
     const tkt = currentTicket;
+    if (!tkt) {
+      return (
+        <div className="w-full px-5 pt-10 pb-28 max-w-md mx-auto text-center space-y-4">
+          <div className="bg-[#E8EFD9] rounded-[28px] p-8 space-y-3">
+            <h2 className="font-extrabold text-[22px] text-[#263B29]">
+              Belum Ada Tiket di Akun Ini
+            </h2>
+            <p className="text-[13.5px] text-[#6B665C]">
+              Scan QR klaim tiket dari Petugas Wahana (SQP Express / Roll
+              Glider) untuk menambahkan tiket ke akun{" "}
+              <strong>{holderDisplayName}</strong>.
+            </p>
+            <div className="pt-2 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setScannerMode("qr-claim");
+                  setShowReceiptScannerModal(true);
+                }}
+                className="bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[14px] py-3 rounded-full cursor-pointer"
+              >
+                📷 Scan QR Klaim Tiket
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveScreen("home")}
+                className="bg-white text-[#263B29] font-bold text-[13.5px] py-2.5 rounded-full cursor-pointer"
+              >
+                ← Kembali ke Home
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     const attr = ATTRACTIONS[tkt.attractionId];
     const isInQueue = tkt.queueStatus === "in_queue";
 
@@ -1433,10 +2450,13 @@ export default function VisitorPortalApp() {
 
           <button
             type="button"
-            onClick={() => setShowReceiptScannerModal(true)}
+            onClick={() => {
+              setScannerMode("qr-claim");
+              setShowReceiptScannerModal(true);
+            }}
             className="bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[12px] px-3.5 py-2 rounded-full shadow-xs flex items-center gap-1.5 cursor-pointer"
           >
-            <span>📷 Scan Receipt</span>
+            <span>📷 Scan QR / Receipt</span>
           </button>
         </div>
 
@@ -1720,6 +2740,55 @@ export default function VisitorPortalApp() {
 
             <button
               type="button"
+              onClick={() => setActiveScreen("login")}
+              className="w-full bg-white hover:bg-[#EDF6E9]/40 border border-[#D8E7D2] rounded-[22px] p-4 flex items-center justify-between transition-colors cursor-pointer text-left shadow-2xs"
+            >
+              <div className="flex items-center gap-3.5">
+                <div className="w-[44px] h-[44px] rounded-[14px] bg-[#EDF6E9] flex items-center justify-center shrink-0 text-[18px]">
+                  🔄
+                </div>
+                <div>
+                  <p className="font-bold text-[15px] text-[#263B29]">
+                    Switch / Add Database Account
+                  </p>
+                  <p className="text-[12px] text-[#6B665C]">
+                    Register new account or pick another visitor
+                  </p>
+                </div>
+              </div>
+              <img
+                src="/assets/visitor/icon-chevron-green.svg"
+                alt=""
+                className="w-[18px] h-[18px]"
+              />
+            </button>
+
+            <Link
+              href="/worker"
+              className="w-full bg-[#EDF6E8]/70 hover:bg-[#EDF6E8] border border-[#A8C943]/60 rounded-[22px] p-4 flex items-center justify-between transition-colors text-left shadow-2xs"
+            >
+              <div className="flex items-center gap-3.5">
+                <div className="w-[44px] h-[44px] rounded-[14px] bg-[#4D8B45] text-white flex items-center justify-center shrink-0 text-[18px]">
+                  🎟️
+                </div>
+                <div>
+                  <p className="font-bold text-[15px] text-[#263B29]">
+                    Worker QR Generator (/worker)
+                  </p>
+                  <p className="text-[12px] text-[#6B665C]">
+                    Generate QR for SQP Express &amp; Roll Glider
+                  </p>
+                </div>
+              </div>
+              <img
+                src="/assets/visitor/icon-chevron-green.svg"
+                alt=""
+                className="w-[18px] h-[18px]"
+              />
+            </Link>
+
+            <button
+              type="button"
               onClick={() => setShowLogoutModal(true)}
               className="w-full bg-white hover:bg-[#FFF5F5] border border-[#E8EFD9] rounded-[22px] p-4 flex items-center justify-between transition-colors cursor-pointer text-left shadow-2xs"
             >
@@ -1817,11 +2886,33 @@ export default function VisitorPortalApp() {
 
         {profileSubView === "edit-profile" && (
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
-              setUserProfile(editProfileDraft);
-              setProfileSubView("account-data");
-              triggerToast("Account profile updated!");
+              try {
+                const res = await fetch("/api/db/accounts", {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    accountId: currentAccountId,
+                    username: editProfileDraft.username,
+                    fullName: editProfileDraft.fullName,
+                    email: editProfileDraft.email,
+                    phone: editProfileDraft.phone,
+                  }),
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                  triggerToast(data.error || "Failed updating profile");
+                  return;
+                }
+                applyAccountPayload(data);
+                setProfileSubView("account-data");
+                triggerToast("Account profile saved to database!");
+              } catch {
+                setUserProfile(editProfileDraft);
+                setProfileSubView("account-data");
+                triggerToast("Account profile updated!");
+              }
             }}
             className="mt-6 bg-white rounded-[24px] p-5 border border-[#D8E7D2] space-y-3.5"
           >
@@ -1902,14 +2993,32 @@ export default function VisitorPortalApp() {
 
         {profileSubView === "change-password" && (
           <form
-            onSubmit={(e) => {
+            onSubmit={async (e) => {
               e.preventDefault();
-              setPasswordForm({
-                currentPassword: "",
-                newPassword: "",
-                confirmPassword: "",
-              });
-              setShowPasswordSuccessModal(true);
+              try {
+                const res = await fetch("/api/db/accounts", {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    accountId: currentAccountId,
+                    currentPassword: passwordForm.currentPassword,
+                    newPassword: passwordForm.newPassword,
+                  }),
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                  triggerToast(data.error || "Password update failed");
+                  return;
+                }
+                setPasswordForm({
+                  currentPassword: "",
+                  newPassword: "",
+                  confirmPassword: "",
+                });
+                setShowPasswordSuccessModal(true);
+              } catch {
+                triggerToast("Failed updating password in database.");
+              }
             }}
             className="mt-6 bg-white rounded-[24px] p-5 border border-[#D8E7D2] space-y-3.5"
           >
@@ -2106,7 +3215,10 @@ export default function VisitorPortalApp() {
               </button>
               <button
                 type="button"
-                onClick={() => openTicketQueueView(currentTicket.id)}
+                onClick={() => {
+                  if (currentTicket) openTicketQueueView(currentTicket.id);
+                  else setActiveScreen("ticket-queue");
+                }}
                 className={`px-3 py-1.5 rounded-full text-[12px] font-bold transition-colors cursor-pointer ${
                   activeScreen === "ticket-queue"
                     ? "bg-[#4D8B45] text-white"
@@ -2145,20 +3257,37 @@ export default function VisitorPortalApp() {
           </div>
 
           <div className="flex items-center gap-2">
+            <Link
+              href="/worker"
+              className="bg-[#A8C943] hover:bg-[#97b838] text-[#183F2A] font-extrabold text-[11.5px] px-3 py-1.5 rounded-full shadow-xs transition-colors flex items-center gap-1"
+            >
+              <span>🎟️ Worker QR</span>
+            </Link>
+
             <button
               type="button"
-              onClick={() => setShowReceiptScannerModal(true)}
+              onClick={() => {
+                setScannerMode("qr-claim");
+                setShowReceiptScannerModal(true);
+              }}
               className="bg-[#F2C94C] hover:bg-[#e5ba38] text-[#263B29] font-extrabold text-[11.5px] px-3 py-1.5 rounded-full shadow-xs cursor-pointer transition-colors flex items-center gap-1.5"
             >
-              <span>📷 Scan Receipt (VLM)</span>
+              <span>📷 Scan QR / Receipt</span>
             </button>
 
             <button
               type="button"
-              onClick={() => setActiveScreen("login")}
+              onClick={() => {
+                setAuthViewTab("welcome");
+                setActiveScreen("login");
+              }}
               className="bg-white/10 hover:bg-white/20 text-[#FFF4DC] font-bold text-[11.5px] px-3 py-1.5 rounded-full cursor-pointer transition-colors"
             >
-              {authMode === "guest" ? "Guest • Sign In" : userProfile.username}
+              {isSyncingDb
+                ? "Syncing..."
+                : authMode === "guest"
+                ? "Guest • Sign In"
+                : userProfile.username}
             </button>
           </div>
         </div>
@@ -2287,21 +3416,26 @@ export default function VisitorPortalApp() {
                 </span>
               </p>
 
-              <div className="mt-4 space-y-2">
-                {[
-                  {
-                    username: "Kevcak",
-                    fullName: "Kevin Cakrun",
-                    email: "kevinCakrun@gmail.com",
-                  },
-                  {
-                    username: "James",
-                    fullName: "James Wijaya",
-                    email: "james.wijaya@gmail.com",
-                  },
-                ].map((acct) => (
+              <div className="mt-4 space-y-2 max-h-60 overflow-y-auto">
+                {(dbAccounts.filter((a) => !a.isGuest).length > 0
+                  ? dbAccounts.filter((a) => !a.isGuest)
+                  : [
+                      {
+                        id: "acc-kevcak",
+                        username: "Kevcak",
+                        fullName: "Kevin Cakrun",
+                        email: "kevinCakrun@gmail.com",
+                      },
+                      {
+                        id: "acc-james",
+                        username: "JamesW",
+                        fullName: "James Wijaya",
+                        email: "james.wijaya@gmail.com",
+                      },
+                    ]
+                ).map((acct) => (
                   <button
-                    key={acct.email}
+                    key={acct.id}
                     type="button"
                     onClick={() => handleSignInWithGoogleAccount(acct)}
                     className="w-full p-3 rounded-2xl border border-gray-200 hover:bg-[#EDF6E9]/50 flex items-center gap-3 text-left transition-colors cursor-pointer"
@@ -2337,7 +3471,7 @@ export default function VisitorPortalApp() {
         </div>
       )}
 
-      {/* 3. In-Browser Receipt VLM Scanner Modal */}
+      {/* 3. Claim Ticket via Worker QR (SQP Express & Roll Glider) OR POS Receipt Scanner Modal */}
       {showReceiptScannerModal && (
         <div
           role="dialog"
@@ -2348,33 +3482,229 @@ export default function VisitorPortalApp() {
             <div className="flex items-start justify-between gap-3 border-b border-[#E8EFD9] pb-3.5">
               <div>
                 <span className="inline-flex items-center gap-1.5 bg-[#4D8B45] text-white text-[10.5px] font-bold px-2.5 py-0.5 rounded-full">
-                  <span>In-Browser VLM</span>
+                  <span>
+                    Akun: {authMode === "guest" ? "Guest" : userProfile.username}
+                  </span>
                   <span>•</span>
-                  <span>{vlmCaps.deviceBackend.toUpperCase()}</span>
+                  <span>Database Synced</span>
                 </span>
                 <h2 className="font-extrabold text-[20px] text-[#263B29] mt-1">
-                  Scan Park Receipt to Load Tickets
+                  {scannerMode === "qr-claim"
+                    ? "Scan QR Petugas untuk Klaim Tiket"
+                    : "Scan Park Receipt to Load Tickets"}
                 </h2>
                 <p className="text-[12px] text-[#6B665C]">
-                  Model:{" "}
-                  <code className="font-bold">{vlmCaps.recommendedModel}</code>{" "}
-                  (~{vlmCaps.estimatedSizeMb} MB {vlmCaps.quantization})
+                  {scannerMode === "qr-claim"
+                    ? "Khusus tiket SQP Express & Roll Glider yang diterbitkan di halaman Petugas (/worker)."
+                    : `${vlmCaps.recommendedModel} (${vlmCaps.deviceBackend.toUpperCase()})`}
                 </p>
               </div>
               <button
                 type="button"
-                onClick={() => setShowReceiptScannerModal(false)}
+                onClick={() => {
+                  stopQrCamera();
+                  setShowReceiptScannerModal(false);
+                }}
                 className="w-8 h-8 rounded-full bg-[#E8EFD9] text-[#263B29] font-bold flex items-center justify-center cursor-pointer"
               >
                 ✕
               </button>
             </div>
 
-            <div className="mt-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <label className="text-[12.5px] font-bold text-[#263B29]">
-                  1. Select a Sample SQP Receipt or Capture Photo:
-                </label>
+            {/* Scanner Mode Switcher */}
+            <div className="mt-4 bg-[#E8EFD9] rounded-full p-1 flex items-center text-[12.5px] font-bold">
+              <button
+                type="button"
+                onClick={() => {
+                  stopQrCamera();
+                  setScannerMode("qr-claim");
+                }}
+                className={`flex-1 py-2 rounded-full transition-all cursor-pointer ${
+                  scannerMode === "qr-claim"
+                    ? "bg-[#4D8B45] text-white shadow-xs"
+                    : "text-[#263B29]"
+                }`}
+              >
+                QR Petugas (Express &amp; Roll Glider)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  stopQrCamera();
+                  setScannerMode("pos-ocr");
+                }}
+                className={`flex-1 py-2 rounded-full transition-all cursor-pointer ${
+                  scannerMode === "pos-ocr"
+                    ? "bg-[#4D8B45] text-white shadow-xs"
+                    : "text-[#263B29]"
+                }`}
+              >
+                Scan Struk POS (OCR)
+              </button>
+            </div>
+
+            {scannerMode === "qr-claim" ? (
+              <div className="mt-4 space-y-3.5">
+                {/* Camera & Upload Controls */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      isCameraActive ? stopQrCamera() : handleStartLiveQrCamera()
+                    }
+                    className={`h-[44px] rounded-2xl font-bold text-[13px] px-3 flex items-center justify-center gap-2 cursor-pointer transition-colors ${
+                      isCameraActive
+                        ? "bg-[#C94B3C] text-white"
+                        : "bg-[#4D8B45] hover:bg-[#3d7236] text-white"
+                    }`}
+                  >
+                    <span>
+                      {isCameraActive
+                        ? "■ Tutup Kamera QR"
+                        : "🎥 Scan QR via Kamera"}
+                    </span>
+                  </button>
+
+                  <label className="h-[44px] bg-white hover:bg-[#E8EFD9]/70 border border-[#D8E7D2] text-[#263B29] font-bold text-[13px] rounded-2xl px-3 flex items-center justify-center gap-2 cursor-pointer">
+                    <span>📷 Upload Gambar QR (.png)</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      capture={device.isTouch ? "environment" : undefined}
+                      onChange={handleQrImageUpload}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+
+                {isCameraActive && (
+                  <div className="relative bg-black rounded-2xl overflow-hidden border-2 border-[#4D8B45]">
+                    <video
+                      ref={videoRef}
+                      playsInline
+                      muted
+                      className="w-full max-h-56 object-cover"
+                    />
+                    <p className="text-center text-[11px] font-bold text-[#F2C94C] py-1.5 bg-[#263B29]">
+                      Arahkan kamera ke QR Code pada halaman /worker
+                    </p>
+                  </div>
+                )}
+
+                {qrScanMethodNote && (
+                  <p className="text-[12px] font-bold text-[#4D8B45] bg-[#E8EFD9] px-3 py-2 rounded-xl">
+                    {qrScanMethodNote}
+                  </p>
+                )}
+
+                {/* Manual QR Code Entry */}
+                <div className="bg-white rounded-2xl p-3.5 border border-[#D8E7D2] space-y-2">
+                  <label className="block text-[12px] font-bold text-[#263B29]">
+                    Atau tempel kode / URL QR klaim:
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={qrCodeInput}
+                      onChange={(e) => setQrCodeInput(e.target.value)}
+                      placeholder="SQP-CLAIM-... atau URL ?claim=..."
+                      className="flex-1 h-[42px] px-3 rounded-xl border border-[#D8E7D2] bg-[#FFF4DC]/40 font-mono text-[12.5px] font-bold text-[#263B29]"
+                    />
+                    <button
+                      type="button"
+                      disabled={isClaimingQr}
+                      onClick={() => handleClaimWorkerQrCode()}
+                      className="bg-[#F2C94C] hover:bg-[#e5ba38] disabled:opacity-50 text-[#263B29] font-extrabold text-[13px] px-4 rounded-xl cursor-pointer shrink-0"
+                    >
+                      {isClaimingQr ? "..." : "Klaim Tiket"}
+                    </button>
+                  </div>
+                </div>
+
+                {qrScanError && (
+                  <p className="text-[12.5px] font-bold text-[#C94B3C] bg-[#FDECE9] px-3.5 py-2.5 rounded-2xl border border-[#C94B3C]/25">
+                    {qrScanError}
+                  </p>
+                )}
+
+                {/* Available Worker QRs in Database (Instant Scan & Claim) */}
+                <div className="bg-white rounded-2xl p-3.5 border border-[#D8E7D2] space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[11.5px] font-extrabold uppercase tracking-wider text-[#6B665C]">
+                      QR Petugas Aktif di Database (
+                      {
+                        availableWorkerQrs.filter(
+                          (q) => q.status === "AVAILABLE"
+                        ).length
+                      }{" "}
+                      AVAILABLE)
+                    </p>
+                    <Link
+                      href="/worker"
+                      className="text-[11.5px] font-bold text-[#4D8B45] hover:underline"
+                    >
+                      + Buat di /worker
+                    </Link>
+                  </div>
+
+                  {availableWorkerQrs.filter((q) => q.status === "AVAILABLE")
+                    .length === 0 ? (
+                    <div className="text-center py-4 text-[12.5px] text-[#6B665C]">
+                      Semua QR petugas sudah diklaim. Buat QR baru di halaman{" "}
+                      <Link
+                        href="/worker"
+                        className="font-bold text-[#4D8B45] underline"
+                      >
+                        /worker
+                      </Link>
+                      .
+                    </div>
+                  ) : (
+                    <div className="space-y-2 max-h-56 overflow-y-auto">
+                      {availableWorkerQrs
+                        .filter((q) => q.status === "AVAILABLE")
+                        .map((qr) => (
+                          <div
+                            key={qr.id}
+                            className="p-2.5 rounded-2xl border border-[#E8EFD9] bg-[#F9FBF7] flex items-center justify-between gap-3"
+                          >
+                            <div className="p-1 bg-white rounded-lg border border-[#E8EFD9] shrink-0">
+                              <QrMatrixSvg value={qr.claimCode} size={52} />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="font-extrabold text-[13px] text-[#263B29] truncate">
+                                {qr.activityName} • {qr.totalParticipants} Orang
+                              </p>
+                              <p className="font-mono text-[10.5px] font-bold text-[#4D8B45] truncate">
+                                {qr.claimCode}
+                              </p>
+                              <p className="text-[11px] text-[#6B665C]">
+                                POS #{qr.posReceiptNumber} ({qr.adultCount}{" "}
+                                dewasa · {qr.childCount} anak)
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={isClaimingQr}
+                              onClick={() =>
+                                handleClaimWorkerQrCode(qr.claimCode)
+                              }
+                              className="bg-[#4D8B45] hover:bg-[#3d7236] text-white font-bold text-[12px] px-3.5 py-2 rounded-full shrink-0 cursor-pointer"
+                            >
+                              Scan &amp; Klaim
+                            </button>
+                          </div>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-[12.5px] font-bold text-[#263B29]">
+                    1. Select a Sample SQP Receipt or Capture Photo:
+                  </label>
                 <label className="bg-[#E8EFD9] hover:bg-[#d8e5c3] text-[#4D8B45] font-bold text-[11.5px] px-3 py-1 rounded-full cursor-pointer">
                   <span>
                     📷 {device.isTouch ? "Open Camera" : "Upload Image"}
@@ -2584,7 +3914,8 @@ export default function VisitorPortalApp() {
                   </button>
                 </div>
               )}
-            </div>
+              </div>
+            )}
           </div>
         </div>
       )}
