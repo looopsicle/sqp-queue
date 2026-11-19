@@ -7,6 +7,10 @@ declare global {
                 userId: string
                 sessionId: string
             }
+            
+            guestAuth?: {
+                guestSessionId: string
+            }
         }
     }
 }

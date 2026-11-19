@@ -3,7 +3,8 @@ import express from "express"
 import cors from "cors"
 import helmet from "helmet"
 
-import authRouter from "./routes/auth.routes.js";
+import authRouter from "./routes/auth.routes.js"
+import guestRouter from "./routes/guest.routes.js"
 
 import { prisma } from "./lib/prisma.js"
 
@@ -20,8 +21,8 @@ app.use(
 
 app.use(express.json())
 
-app.use("/api/auth", authRouter)
 app.use("/api/auth", authRouter) //npm run dev --workspace=@app/api
+app.use("/api/guest", guestRouter)
 
 app.get("/api/health", async (_req, res) => {
   try {
