@@ -20,7 +20,8 @@ app.use(
 
 app.use(express.json())
 
-app.use("/api/auth", authRouter);
+app.use("/api/auth", authRouter)
+app.use("/api/auth", authRouter) //npm run dev --workspace=@app/api
 
 app.get("/api/health", async (_req, res) => {
   try {
