@@ -153,12 +153,15 @@ Or run them independently:
 
 ## Development URLs
 
-| Service | URL |
-| :--- | :--- |
 | **Frontend** | `http://localhost:3000` |
 | **Backend API** | `http://localhost:4000` |
 | **API Health Check** | `http://localhost:4000/api/health` |
 | **pgAdmin** | `http://localhost:5050` |
+
+
+Specific Frontend portals
+http://localhost:3000/visitor
+http://localhost:3000/admin
 
 ---
 
@@ -167,7 +170,6 @@ Or run them independently:
 Run these commands from the project root:
 
 | Command | Description |
-| :--- | :--- |
 | `npm run dev` | Start frontend and backend |
 | `npm run dev:web` | Start frontend only |
 | `npm run dev:api` | Start backend only |
