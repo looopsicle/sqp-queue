@@ -31,8 +31,24 @@ model User {
   queueEntries      QueueEntry[]
   pushSubscriptions PushSubscription[]
   notifications     Notification[]
+  userSessions UserSession[]
 
   @@map("user")
+}
+
+model UserSession {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  tokenHash    String    @unique
+  expiresAt    DateTime
+  lastActiveAt DateTime  @default(now())
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 model OAuthAccount {
