@@ -5,6 +5,7 @@ import helmet from "helmet"
 
 import authRouter from "./routes/auth.routes.js"
 import guestRouter from "./routes/guest.routes.js"
+import attractionRouter from "./routes/attraction.routes.js"
 
 import { prisma } from "./lib/prisma.js"
 
@@ -23,6 +24,7 @@ app.use(express.json())
 
 app.use("/api/auth", authRouter) //npm run dev --workspace=@app/api
 app.use("/api/guest", guestRouter)
+app.use("/api/attractions", attractionRouter)
 
 app.get("/api/health", async (_req, res) => {
   try {
