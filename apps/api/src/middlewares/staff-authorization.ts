@@ -24,6 +24,7 @@ export function authorizeRole(...allowedRoles: StaffRole[]) {
                 },
                 select: {
                     role: true,
+                    isActive: true,
                 },
             })
 

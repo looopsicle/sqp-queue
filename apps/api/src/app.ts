@@ -6,6 +6,7 @@ import helmet from "helmet"
 import authRouter from "./routes/auth.routes.js"
 import guestRouter from "./routes/guest.routes.js"
 import attractionRouter from "./routes/attraction.routes.js"
+import staffRouter from "./routes/staff.routes.js"
 
 import { prisma } from "./lib/prisma.js"
 
@@ -18,32 +19,33 @@ app.use(
         origin: process.env.FRONTEND_URL,
         credentials: true,
     })
-);
+)
 
 app.use(express.json())
 
 app.use("/api/auth", authRouter) //npm run dev --workspace=@app/api
 app.use("/api/guest", guestRouter)
 app.use("/api/attractions", attractionRouter)
+app.use("/api/staff", staffRouter)
 
 app.get("/api/health", async (_req, res) => {
-  try {
-    await prisma.$queryRaw`SELECT 1`;
+    try {
+        await prisma.$queryRaw`SELECT 1`;
 
-    res.status(200).json({
-      success: true,
-      message: "SQP Queue API is running",
-      database: "connected",
-    })
-  } catch (error) {
-    console.error("Database health check failed:", error);
+        res.status(200).json({
+            success: true,
+            message: "SQP Queue API is running",
+            database: "connected",
+        })
+    } catch (error) {
+        console.error("Database health check failed:", error);
 
-    res.status(503).json({
-      success: false,
-      message: "SQP Queue API is running, but database is unavailable",
-      database: "disconnected",
-    })
-  }
+        res.status(503).json({
+            success: false,
+            message: "SQP Queue API is running, but database is unavailable",
+            database: "disconnected",
+        })
+    }
 })
 
 export default app

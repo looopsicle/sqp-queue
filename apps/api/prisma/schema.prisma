@@ -256,7 +256,8 @@ model StaffProfile {
   userId       String    @unique @map("user_id") @db.Uuid
   employeeCode String    @unique @map("employee_code")
   role         StaffRole @default(STAFF)
-
+  isActive Boolean @default(true) @map("is_active")
+  
   user             User              @relation(fields: [userId], references: [id])
   shiftAssignments ShiftAssignment[]
 

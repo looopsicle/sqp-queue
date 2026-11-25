@@ -1,5 +1,11 @@
 import { Router } from "express"
-import { getAttractions, getAttractionById, createAttraction } from "../controllers/attraction.controller.js"
+import { 
+    getAttractions, 
+    getAttractionById, 
+    createAttraction,
+    updateAttractionController,
+    deleteAttractionController,
+} from "../controllers/attraction.controller.js"
 
 import { authenticate } from "../middlewares/authenticate.js"
 import { authorizeRole } from "../middlewares/staff-authorization.js"
@@ -16,6 +22,20 @@ router.post(
     authenticate,
     authorizeRole("SUPER_ADMIN"),
     createAttraction
+)
+
+router.patch(
+    "/:id",
+    authenticate,
+    authorizeRole("SUPER_ADMIN"),
+    updateAttractionController,
+)
+
+router.delete(
+    "/:id",
+    authenticate,
+    authorizeRole("SUPER_ADMIN"),
+    deleteAttractionController,
 )
 
 export default router
