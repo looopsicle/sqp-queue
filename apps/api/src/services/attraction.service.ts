@@ -78,3 +78,45 @@ export async function findAttractionById(id: string) {
         },
     })
 }
+
+
+export class AttractionParentNotFoundError extends Error {
+    constructor() {
+        super("Parent attraction not found.");
+        this.name = "AttractionParentNotFoundError";
+    }
+}
+
+export async function createAttraction(data: {
+    name: string;
+    category: string;
+    parentAttractionId?: string | null;
+}) {
+    const { name, category, parentAttractionId } = data;
+
+    // Pastikan parent attraction tersedia jika parentId diberikan
+    if (parentAttractionId) {
+        const parent = await prisma.attraction.findUnique({
+            where: { id: parentAttractionId },
+            select: { id: true },
+        })
+
+        if (!parent) {
+            throw new AttractionParentNotFoundError();
+        }
+    }
+
+    return prisma.attraction.create({
+        data: {
+            name,
+            category,
+            parentAttractionId: parentAttractionId ?? null,
+        },
+        select: {
+            id: true,
+            name: true,
+            category: true,
+            parentAttractionId: true,
+        },
+    })
+}

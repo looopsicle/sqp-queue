@@ -1,5 +1,10 @@
 import type { Request, Response } from "express"
-import { listAttractions, findAttractionById } from "../services/attraction.service.js"
+import { 
+    listAttractions, 
+    findAttractionById, 
+    createAttraction as createAttractionService, 
+    AttractionParentNotFoundError, 
+} from "../services/attraction.service.js"
 
 const UUID_REGEX =
 /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -79,6 +84,74 @@ export async function getAttractionById(req: Request, res: Response) {
 
         return res.status(500).json({
         message: "Internal server error.",
+        })
+    }
+}
+
+
+// POST /api/attractions
+export async function createAttraction(req: Request, res: Response) {
+    try {
+        const body = req.body ?? {}
+
+        const { name, category, parentAttractionId } = body
+
+        // Validate name
+        if (typeof name !== "string" || !name.trim()) {
+            return res.status(400).json({
+                success: false,
+                message: "Name is required and must be a non-empty string.",
+            })
+        }
+
+        // Validate category
+        if (typeof category !== "string" || !category.trim()) {
+            return res.status(400).json({
+                success: false,
+                message: "Category is required and must be a non-empty string.",
+            })
+        }
+
+        // Validate parentAttractionId
+        if (
+            parentAttractionId !== undefined &&
+            parentAttractionId !== null &&
+            (
+                typeof parentAttractionId !== "string" ||
+                !UUID_REGEX.test(parentAttractionId)
+            )
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "parentAttractionId must be a valid UUID or null.",
+            })
+        }
+
+        const attraction = await createAttractionService({
+            name: name.trim(),
+            category: category.trim(),
+            parentAttractionId: parentAttractionId ?? null,
+        })
+
+        return res.status(201).json({
+            success: true,
+            message: "Attraction created successfully.",
+            data: attraction,
+        })
+
+    } catch (error) {
+        if (error instanceof AttractionParentNotFoundError) {
+            return res.status(404).json({
+                success: false,
+                message: error.message,
+            })
+        }
+
+        console.error("Create attraction error:", error)
+
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error.",
         })
     }
 }
