@@ -7,6 +7,7 @@ import authRouter from "./routes/auth.routes.js"
 import guestRouter from "./routes/guest.routes.js"
 import attractionRouter from "./routes/attraction.routes.js"
 import staffRouter from "./routes/staff.routes.js"
+import shiftRouter from "./routes/shift.routes.js";
 
 import { prisma } from "./lib/prisma.js"
 
@@ -27,6 +28,7 @@ app.use("/api/auth", authRouter) //npm run dev --workspace=@app/api
 app.use("/api/guest", guestRouter)
 app.use("/api/attractions", attractionRouter)
 app.use("/api/staff", staffRouter)
+app.use("/api/shifts", shiftRouter);
 
 app.get("/api/health", async (_req, res) => {
     try {
